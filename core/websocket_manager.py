@@ -321,39 +321,39 @@ class WebSocketManager:
             session_id: Optional session identifier for reconnection support.
 
         Returns:
-            The generated connection_id (UUID).
+            The generated connection_id (UUID), or empty string if rejected.
         """
-        await websocket.accept()
-
         connection_id: str = str(uuid.uuid4())
         resolved_session_id: str = session_id or str(uuid.uuid4())
         now: datetime = datetime.utcnow()
-
-        info: ConnectionInfo = ConnectionInfo(
-            connection_id=connection_id,
-            session_id=resolved_session_id,
-            room=room,
-            websocket=websocket,
-            connected_at=now,
-            last_active=now,
-            client_info=client_info or {},
-            message_queue=asyncio.Queue(maxsize=self._config.message_buffer_size),
-            failure_count=0,
-            is_alive=True,
-        )
 
         async with self._lock:
             if room not in self.connections:
                 self.connections[room] = {}
 
-            # Check room capacity
+            # Check room capacity before accepting the WebSocket handshake
             if len(self.connections[room]) >= self._config.max_connections_per_room:
                 logger.warning(
                     "Room at max capacity, rejecting connection",
                     extra={"room": room, "connection_id": connection_id},
                 )
-                await websocket.close(code=1013)
                 return ""
+
+            # Accept only after confirming capacity
+            await websocket.accept()
+
+            info: ConnectionInfo = ConnectionInfo(
+                connection_id=connection_id,
+                session_id=resolved_session_id,
+                room=room,
+                websocket=websocket,
+                connected_at=now,
+                last_active=now,
+                client_info=client_info or {},
+                message_queue=asyncio.Queue(maxsize=self._config.message_buffer_size),
+                failure_count=0,
+                is_alive=True,
+            )
 
             self.connections[room][connection_id] = info
             self._metrics.total_connections += 1
@@ -487,33 +487,41 @@ class WebSocketManager:
             del self._disconnected_sessions[session_id]
             return None
 
-        # Accept and re-register
-        await websocket.accept()
-
         # Increment reconnect attempt counter
         old_info.reconnect_attempts += 1
 
         connection_id: str = str(uuid.uuid4())
         now: datetime = datetime.utcnow()
 
-        info: ConnectionInfo = ConnectionInfo(
-            connection_id=connection_id,
-            session_id=session_id,
-            room=room,
-            websocket=websocket,
-            connected_at=now,
-            last_active=now,
-            client_info=old_info.client_info,
-            message_queue=asyncio.Queue(maxsize=self._config.message_buffer_size),
-            failure_count=0,
-            is_alive=True,
-            disconnected_at=None,
-            reconnect_attempts=old_info.reconnect_attempts,
-        )
-
         async with self._lock:
             if room not in self.connections:
                 self.connections[room] = {}
+
+            # Check room capacity before accepting the WebSocket handshake
+            if len(self.connections[room]) >= self._config.max_connections_per_room:
+                logger.warning(
+                    "Room at max capacity, rejecting reconnection",
+                    extra={"room": room, "session_id": session_id},
+                )
+                return None
+
+            # Accept only after confirming capacity
+            await websocket.accept()
+
+            info: ConnectionInfo = ConnectionInfo(
+                connection_id=connection_id,
+                session_id=session_id,
+                room=room,
+                websocket=websocket,
+                connected_at=now,
+                last_active=now,
+                client_info=old_info.client_info,
+                message_queue=asyncio.Queue(maxsize=self._config.message_buffer_size),
+                failure_count=0,
+                is_alive=True,
+                disconnected_at=None,
+                reconnect_attempts=old_info.reconnect_attempts,
+            )
 
             self.connections[room][connection_id] = info
             self._metrics.total_connections += 1
@@ -845,7 +853,7 @@ class WebSocketManager:
         Gracefully shut down the manager.
 
         Closes all connections with code 1001 (going away), cancels all
-        background tasks, and clears all data structures.
+        background tasks, awaits their completion, and clears all data structures.
         """
         self._shutdown = True
         logger.info("WebSocket manager shutting down")
@@ -856,7 +864,8 @@ class WebSocketManager:
                 for conn_id, info in room_conns.items():
                     all_connections.append((room, conn_id, info))
 
-        # Close all connections
+        # Close all connections and collect cancelled tasks
+        cancelled_tasks: List[asyncio.Task] = []  # type: ignore[type-arg]
         for room, conn_id, info in all_connections:
             try:
                 await info.websocket.close(code=1001)
@@ -870,9 +879,26 @@ class WebSocketManager:
                     },
                 )
 
-            self._cancel_tasks_for_connection(conn_id)
+            # Cancel tasks and collect them for awaiting
+            heartbeat_task: Optional[asyncio.Task] = self._heartbeat_tasks.pop(  # type: ignore[type-arg]
+                conn_id, None
+            )
+            if heartbeat_task is not None and not heartbeat_task.done():
+                heartbeat_task.cancel()
+                cancelled_tasks.append(heartbeat_task)
 
-        # Clear all data structures
+            consumer_task: Optional[asyncio.Task] = self._consumer_tasks.pop(  # type: ignore[type-arg]
+                conn_id, None
+            )
+            if consumer_task is not None and not consumer_task.done():
+                consumer_task.cancel()
+                cancelled_tasks.append(consumer_task)
+
+        # Await all cancelled tasks to ensure they have fully stopped
+        if cancelled_tasks:
+            await asyncio.gather(*cancelled_tasks, return_exceptions=True)
+
+        # Clear all data structures only after tasks have stopped
         async with self._lock:
             self.connections.clear()
             self._disconnected_sessions.clear()
@@ -884,7 +910,7 @@ class WebSocketManager:
         """Return connection metrics as a dictionary."""
         return self._metrics.to_dict()
 
-    def get_room_info(self, room: str) -> Dict[str, Any]:
+    async def get_room_info(self, room: str) -> Dict[str, Any]:
         """
         Return information about a specific room.
 
@@ -894,28 +920,29 @@ class WebSocketManager:
         Returns:
             Dictionary with connection count and connection metadata.
         """
-        room_connections: Optional[Dict[str, ConnectionInfo]] = self.connections.get(
-            room
-        )
-        if room_connections is None:
-            return {"room": room, "connection_count": 0, "connections": []}
-
-        connections_info: List[Dict[str, Any]] = []
-        for conn_id, info in room_connections.items():
-            connections_info.append(
-                {
-                    "connection_id": info.connection_id,
-                    "session_id": info.session_id,
-                    "connected_at": info.connected_at.isoformat(),
-                    "last_active": info.last_active.isoformat(),
-                    "client_info": info.client_info,
-                    "is_alive": info.is_alive,
-                    "failure_count": info.failure_count,
-                }
+        async with self._lock:
+            room_connections: Optional[Dict[str, ConnectionInfo]] = (
+                self.connections.get(room)
             )
+            if room_connections is None:
+                return {"room": room, "connection_count": 0, "connections": []}
 
-        return {
-            "room": room,
-            "connection_count": len(room_connections),
-            "connections": connections_info,
-        }
+            connections_info: List[Dict[str, Any]] = []
+            for conn_id, info in room_connections.items():
+                connections_info.append(
+                    {
+                        "connection_id": info.connection_id,
+                        "session_id": info.session_id,
+                        "connected_at": info.connected_at.isoformat(),
+                        "last_active": info.last_active.isoformat(),
+                        "client_info": info.client_info,
+                        "is_alive": info.is_alive,
+                        "failure_count": info.failure_count,
+                    }
+                )
+
+            return {
+                "room": room,
+                "connection_count": len(room_connections),
+                "connections": connections_info,
+            }
