@@ -111,6 +111,8 @@ class ConnectionInfo:
     message_queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue())  # type: ignore[type-arg]
     failure_count: int = 0
     is_alive: bool = True
+    disconnected_at: Optional[datetime] = None
+    reconnect_attempts: int = 0
 
 
 @dataclass
@@ -263,6 +265,15 @@ class CircuitBreaker:
         self._states.pop(connection_id, None)
         self._last_failure_time.pop(connection_id, None)
 
+    def remaining_reset_seconds(self, connection_id: str) -> float:
+        """Return seconds remaining until the circuit breaker resets for a connection."""
+        last_failure: float = self._last_failure_time.get(connection_id, 0.0)
+        elapsed: float = time_module.monotonic() - last_failure
+        remaining: float = self._config.circuit_breaker_reset_seconds - elapsed
+        if remaining < 0.0:
+            return 0.0
+        return remaining
+
 
 # ---------------------------------------------------------------------------
 # WebSocket Manager
@@ -342,7 +353,7 @@ class WebSocketManager:
                     extra={"room": room, "connection_id": connection_id},
                 )
                 await websocket.close(code=1013)
-                return connection_id
+                return ""
 
             self.connections[room][connection_id] = info
             self._metrics.total_connections += 1
@@ -395,10 +406,14 @@ class WebSocketManager:
 
             info = self.connections[room].pop(connection_id)
             info.is_alive = False
+            info.disconnected_at = datetime.utcnow()
             self._metrics.active_connections -= 1
 
             # Store for potential reconnection
             self._disconnected_sessions[info.session_id] = info
+
+            # Sweep stale disconnected sessions to prevent unbounded growth
+            self._sweep_disconnected_sessions()
 
             if not self.connections[room]:
                 del self.connections[room]
@@ -445,8 +460,12 @@ class WebSocketManager:
 
         old_info: ConnectionInfo = self._disconnected_sessions[session_id]
 
-        # Check if within reconnect window
-        elapsed: float = (datetime.utcnow() - old_info.connected_at).total_seconds()
+        # Check if within reconnect window (measured from disconnect time)
+        disconnect_time: Optional[datetime] = old_info.disconnected_at
+        if disconnect_time is None:
+            # Fallback: treat connected_at as disconnect time
+            disconnect_time = old_info.connected_at
+        elapsed: float = (datetime.utcnow() - disconnect_time).total_seconds()
         if elapsed > self._config.reconnect_window_seconds:
             logger.warning(
                 "Reconnect failed: window expired",
@@ -455,8 +474,24 @@ class WebSocketManager:
             del self._disconnected_sessions[session_id]
             return None
 
+        # Check max reconnect attempts
+        if old_info.reconnect_attempts >= self._config.max_reconnect_attempts:
+            logger.warning(
+                "Reconnect failed: max attempts exceeded",
+                extra={
+                    "session_id": session_id,
+                    "room": room,
+                    "attempts": old_info.reconnect_attempts,
+                },
+            )
+            del self._disconnected_sessions[session_id]
+            return None
+
         # Accept and re-register
         await websocket.accept()
+
+        # Increment reconnect attempt counter
+        old_info.reconnect_attempts += 1
 
         connection_id: str = str(uuid.uuid4())
         now: datetime = datetime.utcnow()
@@ -472,6 +507,8 @@ class WebSocketManager:
             message_queue=asyncio.Queue(maxsize=self._config.message_buffer_size),
             failure_count=0,
             is_alive=True,
+            disconnected_at=None,
+            reconnect_attempts=old_info.reconnect_attempts,
         )
 
         async with self._lock:
@@ -518,7 +555,7 @@ class WebSocketManager:
             while not self._shutdown:
                 await asyncio.sleep(self._config.ping_interval_seconds)
 
-                info: Optional[ConnectionInfo] = self._get_connection_info(
+                info: Optional[ConnectionInfo] = await self._get_connection_info(
                     connection_id, room
                 )
                 if info is None or not info.is_alive:
@@ -552,7 +589,7 @@ class WebSocketManager:
         """
         try:
             while not self._shutdown:
-                info: Optional[ConnectionInfo] = self._get_connection_info(
+                info: Optional[ConnectionInfo] = await self._get_connection_info(
                     connection_id, room
                 )
                 if info is None or not info.is_alive:
@@ -580,7 +617,11 @@ class WebSocketManager:
                             extra={"connection_id": connection_id, "room": room},
                         )
                         self._metrics.record_message_failed()
-                    await asyncio.sleep(1.0)
+                    # Sleep for remaining circuit reset time instead of fixed 1s
+                    remaining_reset: float = (
+                        self._circuit_breaker.remaining_reset_seconds(connection_id)
+                    )
+                    await asyncio.sleep(remaining_reset)
                     continue
 
                 try:
@@ -603,16 +644,17 @@ class WebSocketManager:
         except asyncio.CancelledError:
             pass
 
-    def _get_connection_info(
+    async def _get_connection_info(
         self, connection_id: str, room: str
     ) -> Optional[ConnectionInfo]:
-        """Get connection info without lock (for use within async tasks)."""
-        room_connections: Optional[Dict[str, ConnectionInfo]] = self.connections.get(
-            room
-        )
-        if room_connections is None:
-            return None
-        return room_connections.get(connection_id)
+        """Get connection info with lock for safe access from async tasks."""
+        async with self._lock:
+            room_connections: Optional[Dict[str, ConnectionInfo]] = (
+                self.connections.get(room)
+            )
+            if room_connections is None:
+                return None
+            return room_connections.get(connection_id)
 
     def _cancel_tasks_for_connection(self, connection_id: str) -> None:
         """Cancel heartbeat and consumer tasks for a connection."""
@@ -627,6 +669,21 @@ class WebSocketManager:
         )
         if consumer_task is not None and not consumer_task.done():
             consumer_task.cancel()
+
+    def _sweep_disconnected_sessions(self) -> None:
+        """Remove stale entries from _disconnected_sessions that have exceeded the reconnect window."""
+        now: datetime = datetime.utcnow()
+        stale_keys: List[str] = []
+        for session_id, info in self._disconnected_sessions.items():
+            disconnect_time: Optional[datetime] = info.disconnected_at
+            if disconnect_time is None:
+                # Fallback: treat connected_at as disconnect time
+                disconnect_time = info.connected_at
+            elapsed: float = (now - disconnect_time).total_seconds()
+            if elapsed > self._config.reconnect_window_seconds:
+                stale_keys.append(session_id)
+        for key in stale_keys:
+            del self._disconnected_sessions[key]
 
     async def _send_to_connection(
         self, connection_id: str, room: str, payload: Dict[str, Any]
@@ -644,7 +701,9 @@ class WebSocketManager:
             )
             return
 
-        info: Optional[ConnectionInfo] = self._get_connection_info(connection_id, room)
+        info: Optional[ConnectionInfo] = await self._get_connection_info(
+            connection_id, room
+        )
         if info is None or not info.is_alive:
             return
 
